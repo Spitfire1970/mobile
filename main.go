@@ -1,29 +1,57 @@
 package main
 
+import _ "github.com/lib/pq"
 import (
-	"fmt"
-	"net/http"
-	"sync/atomic"
+	"database/sql"
 	"encoding/json"
+	"fmt"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
+	"mobile-haha/internal/database"
+	"net/http"
+	"os"
 	"strings"
+	"sync/atomic"
+	"time"
 )
+
+type User struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Email     string    `json:"email"`
+}
+
+type Chirp struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserId    uuid.UUID `json:"user_id"`
+}
+
+type failVals struct {
+	Err string `json:"error"`
+}
 
 type apiConfig struct {
 	fileserverHits atomic.Int32
+	query          *database.Queries
+	env            string
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
-    return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-        cfg.fileserverHits.Add(1)
-        next.ServeHTTP(rw, req)
-    })
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		cfg.fileserverHits.Add(1)
+		next.ServeHTTP(rw, req)
+	})
 }
-func health (rw http.ResponseWriter, req *http.Request) {
+func health(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Add("Content-Type", "text/plain; charset=utf-8")
 	rw.Write([]byte("OK"))
 }
 
-func (cfg *apiConfig) metrics (rw http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) metrics(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Add("Content-Type", "text/html")
 	s := fmt.Sprintf(`<html>
   <body>
@@ -34,27 +62,27 @@ func (cfg *apiConfig) metrics (rw http.ResponseWriter, req *http.Request) {
 	fmt.Fprintf(rw, "%s", s)
 }
 
-func (cfg *apiConfig) reset (rw http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) reset(rw http.ResponseWriter, req *http.Request) {
+	if cfg.env != "dev" {
+		rw.WriteHeader(403)
+		return
+	}
 	cfg.fileserverHits.Store(0)
+	cfg.query.DeleteAllUsers(req.Context())
 	rw.WriteHeader(http.StatusOK)
 }
 
-func validateChirp (rw http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) chirp(rw http.ResponseWriter, req *http.Request) {
 	rw.Header().Add("Content-Type", "application/json")
-    type failVals struct {
-		Err string `json:"error"`
-    }
-    type successVals struct {
-		Valid string `json:"cleaned_body"`
-    }
-    type parameters struct {
-        Chirp string `json:"body"`
-    }
+	type parameters struct {
+		Chirp  string    `json:"body"`
+		UserId uuid.UUID `json:"user_id"`
+	}
 
-    decoder := json.NewDecoder(req.Body)
-    params := parameters{}
-    err := decoder.Decode(&params)
-    if err != nil {
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
 		rw.WriteHeader(500)
 		res := failVals{
 			Err: "Something went wrong",
@@ -62,7 +90,7 @@ func validateChirp (rw http.ResponseWriter, req *http.Request) {
 		dat, _ := json.Marshal(res)
 		rw.Write(dat)
 		return
-    }
+	}
 	if len(params.Chirp) > 150 {
 		rw.WriteHeader(400)
 		res := failVals{
@@ -85,17 +113,62 @@ func validateChirp (rw http.ResponseWriter, req *http.Request) {
 		}
 		n = append(n, new)
 	}
+	chirp, err := cfg.query.CreateChirp(req.Context(), database.CreateChirpParams{Body: strings.Join(n, " "), UserID: params.UserId})
+	if err != nil {
+		rw.WriteHeader(500)
+	}
+	respBody := Chirp{
+		ID:        chirp.ID,
+		Body:      chirp.Body,
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		UserId:    chirp.UserID,
+	}
+	dat, _ := json.Marshal(respBody)
+	rw.WriteHeader(201)
+	rw.Write(dat)
+}
 
-    respBody := successVals{
-        Valid: strings.Join(n, " "),
-    }
-    dat, _ := json.Marshal(respBody)
+func (cfg *apiConfig) addUser(rw http.ResponseWriter, req *http.Request) {
+	rw.Header().Add("Content-Type", "application/json")
+	type parameters struct {
+		Email string `json:"email"`
+	}
 
-    rw.Write(dat)
+	decoder := json.NewDecoder(req.Body)
+	params := parameters{}
+	err := decoder.Decode(&params)
+	if err != nil {
+		rw.WriteHeader(500)
+		res := failVals{
+			Err: "Something went wrong",
+		}
+		dat, _ := json.Marshal(res)
+		rw.Write(dat)
+		return
+	}
+	user, err := cfg.query.CreateUser(req.Context(), params.Email)
+	if err != nil {
+		rw.WriteHeader(500)
+		fmt.Printf("%s", err.Error())
+	}
+	respBody := User{
+		ID:        user.ID,
+		Email:     user.Email,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+	}
+	dat, _ := json.Marshal(respBody)
+	rw.WriteHeader(201)
+	rw.Write(dat)
 }
 
 func main() {
-	apiCfg := apiConfig{}
+	godotenv.Load()
+	dbURL := os.Getenv("DB_URL")
+	db, _ := sql.Open("postgres", dbURL)
+	dbQueries := database.New(db)
+	apiCfg := apiConfig{query: dbQueries, env: os.Getenv("PLATFORM")}
 	mux := http.NewServeMux()
 	var filesSytems http.Dir = "."
 	h := http.FileServer(filesSytems)
@@ -104,8 +177,8 @@ func main() {
 	mux.HandleFunc("GET /api/healthz", health)
 	mux.HandleFunc("GET /admin/metrics", apiCfg.metrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.reset)
-	mux.HandleFunc("POST /api/validate_chirp", validateChirp)
-
+	mux.HandleFunc("POST /api/users", apiCfg.addUser)
+	mux.HandleFunc("POST /api/chirps", apiCfg.chirp)
 
 	server := &http.Server{
 		Addr:    ":8080",
