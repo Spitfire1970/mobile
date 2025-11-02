@@ -55,3 +55,13 @@ func MakeRefreshToken() (string, error) {
 	rand.Read(key)
 	return hex.EncodeToString(key), nil
 }
+
+func GetAPIKey(headers http.Header) (string, error) {
+	s := headers.Get("Authorization")
+	
+	if s == "" || !strings.HasPrefix(s, "ApiKey ") {
+		return "", errors.New("no header")
+	}
+	t := s[7:]
+	return t, nil
+}
